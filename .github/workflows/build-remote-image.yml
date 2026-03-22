@@ -51,6 +51,8 @@ jobs:
         with:
           context: .
           file: crates/remote/Dockerfile
+          args: |
+            VITE_RELAY_API_BASE_URL: ${VITE_RELAY_API_BASE_URL:-}
           push: true
           tags: |
             ${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.tag }}
