@@ -12,6 +12,13 @@ on:
       - "v*"
       - "remote-v*"
 
+# Scoped to the ref so concurrent builds on different tags don't block each other.
+# cancel-in-progress: true means a new push cancels the queued build, not the
+# already-running test suite — they have different group names.
+concurrency:
+  group: build-${{ github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   # ----------------------------------------------------------------
   # Resolve the tag once; both build jobs consume it as an output.
