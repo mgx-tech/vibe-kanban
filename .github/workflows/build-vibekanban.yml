@@ -1,1 +1,111 @@
-s
+name: Build and publish images
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag (e.g. v0.1.32-20260318082626)"
+        required: true
+        default: "latest"
+  push:
+    tags:
+      - "v*"
+      - "remote-v*"
+
+jobs:
+  # ----------------------------------------------------------------
+  # Resolve the tag once; both build jobs consume it as an output.
+  # ----------------------------------------------------------------
+  set-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - name: Resolve tag
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.image_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          fi
+
+  # ----------------------------------------------------------------
+  # Build both images in parallel via matrix.
+  # Each matrix entry owns its cache scope so jobs never corrupt
+  # each other's layer cache.
+  # ----------------------------------------------------------------
+  build:
+    needs: set-tag
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false          # a broken executor build won't cancel remote-server
+      matrix:
+        include:
+          - name: remote-server
+            image: ghcr.io/${{ github.repository_owner }}/vibekanban-remote
+            dockerfile: crates/remote/Dockerfile
+            # build-args resolved in the step below via env
+
+          - name: executor
+            image: ghcr.io/${{ github.repository_owner }}/vibekanban-executor
+            dockerfile: Dockerfile.executor
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # SECURITY: GITHUB_TOKEN is scoped to this run only
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ matrix.image }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Resolve build args — remote-server
+        if: matrix.name == 'remote-server'
+        id: remote-args
+        run: |
+          cat <<'EOF' >> $GITHUB_OUTPUT
+          value<<ARGS_EOF
+          VITE_RELAY_API_BASE_URL=${{ vars.VITE_RELAY_API_BASE_URL }}
+          PUBLIC_BASE_URL=${{ vars.PUBLIC_BASE_URL }}
+          REMOTE_SERVER_PORT=${{ vars.REMOTE_SERVER_PORT }}
+          ARGS_EOF
+          EOF
+
+      - name: Build and push — ${{ matrix.name }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          build-args: ${{ matrix.name == 'remote-server' && steps.remote-args.outputs.value || '' }}
+          tags: |
+            ${{ matrix.image }}:${{ needs.set-tag.outputs.tag }}
+            ${{ matrix.image }}:latest
+          labels: ${{ steps.meta.outputs.labels }}
+          # Scoped cache prevents the two parallel jobs from overwriting
+          # each other's GHA cache entries.
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          provenance: true        # generates SLSA build provenance attestation
+          sbom: true              # generates SBOM attached to the image manifest
