@@ -4,46 +4,39 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Image tag (e.g. v0.1.32-20260318082626)"
+        description: "Image tag (e.g. v1.0.1)"
         required: true
         default: "latest"
   push:
     tags:
       - "v*"
-      - "remote-v*"
 
-# Scoped to the ref so concurrent builds on different tags don't block each other.
-# cancel-in-progress: true means a new push cancels the queued build, not the
-# already-running test suite — they have different group names.
 concurrency:
   group: build-${{ github.ref_name }}
   cancel-in-progress: true
 
 jobs:
-  # ----------------------------------------------------------------
-  # Resolve the tag once; both build jobs consume it as an output.
-  # ----------------------------------------------------------------
-  set-tag:
+  set-vars:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.vars.outputs.tag }}
+      owner_lc: ${{ steps.vars.outputs.owner_lc }}
     steps:
-      - name: Resolve tag
+      - name: Resolve tag and lowercase owner
         id: vars
+        shell: bash
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.image_tag }}" >> $GITHUB_OUTPUT
+            echo "tag=${{ github.event.inputs.image_tag }}" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
 
-  # ----------------------------------------------------------------
-  # Build both images in parallel via matrix.
-  # Each matrix entry owns its cache scope so jobs never corrupt
-  # each other's layer cache.
-  # ----------------------------------------------------------------
+          OWNER_LC="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "owner_lc=${OWNER_LC}" >> "$GITHUB_OUTPUT"
+
   build:
-    needs: set-tag
+    needs: set-vars
     runs-on: ubuntu-latest
 
     permissions:
@@ -51,21 +44,30 @@ jobs:
       packages: write
 
     strategy:
-      fail-fast: false          # a broken executor build won't cancel remote-server
+      fail-fast: false
       matrix:
         include:
           - name: remote-server
-            image: ghcr.io/${{ github.repository_owner }}/vibekanban-remote
+            image_name: vibekanban-remote
             dockerfile: crates/remote/Dockerfile
-            # build-args resolved in the step below via env
 
           - name: executor
-            image: ghcr.io/${{ github.repository_owner }}/vibekanban-executor
+            image_name: vibekanban-executor
             dockerfile: Dockerfile.executor
+
+          - name: relay
+            image_name: vibekanban-relay
+            dockerfile: crates/relay-tunnel/Dockerfile
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set image name
+        id: image
+        shell: bash
+        run: |
+          echo "name=ghcr.io/${{ needs.set-vars.outputs.owner_lc }}/${{ matrix.image_name }}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -75,23 +77,24 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          # SECURITY: GITHUB_TOKEN is scoped to this run only
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ matrix.image }}
+          images: ${{ steps.image.outputs.name }}
           labels: |
             org.opencontainers.image.title=${{ matrix.name }}
             org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.set-vars.outputs.tag }}
 
       - name: Resolve build args — remote-server
         if: matrix.name == 'remote-server'
         id: remote-args
+        shell: bash
         run: |
-          cat <<'EOF' >> $GITHUB_OUTPUT
+          cat <<'EOF' >> "$GITHUB_OUTPUT"
           value<<ARGS_EOF
           VITE_RELAY_API_BASE_URL=${{ vars.VITE_RELAY_API_BASE_URL }}
           PUBLIC_BASE_URL=${{ vars.PUBLIC_BASE_URL }}
@@ -107,12 +110,10 @@ jobs:
           push: true
           build-args: ${{ matrix.name == 'remote-server' && steps.remote-args.outputs.value || '' }}
           tags: |
-            ${{ matrix.image }}:${{ needs.set-tag.outputs.tag }}
-            ${{ matrix.image }}:latest
+            ${{ steps.image.outputs.name }}:${{ needs.set-vars.outputs.tag }}
+            ${{ steps.image.outputs.name }}:latest
           labels: ${{ steps.meta.outputs.labels }}
-          # Scoped cache prevents the two parallel jobs from overwriting
-          # each other's GHA cache entries.
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
-          provenance: true        # generates SLSA build provenance attestation
-          sbom: true              # generates SBOM attached to the image manifest
+          provenance: true
+          sbom: true
